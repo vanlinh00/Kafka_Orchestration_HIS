@@ -1,6 +1,0 @@
-{
-  "name": "HIS Kafka Backbone Architecture & Execution Guide",
-  "description": "Enterprise design specification, Kafka topic taxonomy, saga orchestration, and Java 17/Spring Boot 3.4 execution workbench for Hospital Information Systems.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
