@@ -1,0 +1,93 @@
+spring:
+  application:
+    name: his-kafka-backbone
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:his_db}
+    username: ${DB_USER:his_admin}
+    password: ${DB_PASSWORD:his_secret_pass}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 25
+      minimum-idle: 5
+      idle-timeout: 300000
+      max-lifetime: 1200000
+      connection-timeout: 20000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    
+    # PRODUCER CONFIGURATION: Exactly-Once Semantics (EOS)
+    producer:
+      acks: all
+      retries: 2147483647 # Integer.MAX_VALUE
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      compression-type: zstd
+      transaction-id-prefix: his-tx-${random.uuid}-
+      properties:
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        schema.registry.url: ${SCHEMA_REGISTRY_URL:http://localhost:8081}
+        auto.register.schemas: false # Production: schema evolution controlled via CI/CD
+
+    # CONSUMER CONFIGURATION: Zero-Data-Loss Invariants
+    consumer:
+      group-id: his-default-consumer-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false # CRITICAL: No automatic offset commits in HIS
+      isolation-level: read_committed # Filter out uncommitted / aborted saga transactions
+      key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+        spring.deserializer.value.delegate.class: io.confluent.kafka.serializers.KafkaAvroDeserializer
+        schema.registry.url: ${SCHEMA_REGISTRY_URL:http://localhost:8081}
+        specific.avro.reader: true
+
+    listener:
+      ack-mode: MANUAL_IMMEDIATE # Sync ack only after DB commit
+      concurrency: 6
+      observation-enabled: true # Micrometer & OpenTelemetry Tracing
+
+# TOPIC DEFINITION CATALOG
+his:
+  topics:
+    patient-adt: his.patient.adt.v1
+    patient-master-index: his.patient.master-index.v1
+    clinical-orders: his.clinical.cpoe-orders.v1
+    clinical-lab-results: his.clinical.lab-results.v1
+    clinical-vitals-telemetry: his.clinical.vitals-telemetry.v1
+    pharmacy-prescriptions: his.pharmacy.prescriptions.v1
+    pharmacy-dispense: his.pharmacy.dispense-events.v1
+    pharmacy-saga-commands: his.pharmacy.saga-commands.v1
+    billing-claims: his.billing.claims.v1
+    billing-preauth: his.billing.preauth-requests.v1
+
+# MANAGEMENT & HEALTH
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true

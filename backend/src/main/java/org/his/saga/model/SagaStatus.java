@@ -1,0 +1,22 @@
+package org.his.saga.model;
+
+/**
+ * Saga lifecycle state machine status codes.
+ */
+public enum SagaStatus {
+    STARTED,
+    INVENTORY_RESERVATION_PENDING,
+    INVENTORY_RESERVED,
+    BILLING_PREAUTH_PENDING,
+    BILLING_PREAUTH_APPROVED,
+    DISPATCH_PENDING,
+    COMPLETED,
+
+    // Failure & Compensation States
+    FAILED_OUT_OF_STOCK,
+    COMPENSATING_BILLING_FAILED,
+    COMPENSATED_BILLING_FAILED,
+    COMPENSATING_DISPATCH_JAM,
+    COMPENSATED_DISPATCH_JAM,
+    FAILED_TERMINATED
+}
