@@ -105,12 +105,57 @@ public class KafkaTopicConfiguration {
 
     @Bean
     public NewTopic pharmacySagaCommandsTopic() {
-        return TopicBuilder.name("his.pharmacy.saga-commands.v1")
+        return TopicBuilder.name("his.pharmacy.commands.v1")
                 .partitions(12)
                 .replicas(DEFAULT_REPLICATION_FACTOR)
                 .config(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, MIN_INSYNC_REPLICAS)
                 .config(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE)
                 .config(TopicConfig.RETENTION_MS_CONFIG, String.valueOf(7L * 24 * 3600 * 1000))
+                .build();
+    }
+
+    @Bean
+    public NewTopic pharmacyEventsTopic() {
+        return TopicBuilder.name("his.pharmacy.events.v1")
+                .partitions(12)
+                .replicas(DEFAULT_REPLICATION_FACTOR)
+                .config(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, MIN_INSYNC_REPLICAS)
+                .build();
+    }
+
+    @Bean
+    public NewTopic billingCommandsTopic() {
+        return TopicBuilder.name("his.billing.commands.v1")
+                .partitions(12)
+                .replicas(DEFAULT_REPLICATION_FACTOR)
+                .config(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, MIN_INSYNC_REPLICAS)
+                .build();
+    }
+
+    @Bean
+    public NewTopic billingEventsTopic() {
+        return TopicBuilder.name("his.billing.events.v1")
+                .partitions(12)
+                .replicas(DEFAULT_REPLICATION_FACTOR)
+                .config(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, MIN_INSYNC_REPLICAS)
+                .build();
+    }
+
+    @Bean
+    public NewTopic patientTimelineCommandsTopic() {
+        return TopicBuilder.name("his.patient.timeline-commands.v1")
+                .partitions(12)
+                .replicas(DEFAULT_REPLICATION_FACTOR)
+                .config(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, MIN_INSYNC_REPLICAS)
+                .build();
+    }
+
+    @Bean
+    public NewTopic patientEventsTopic() {
+        return TopicBuilder.name("his.patient.events.v1")
+                .partitions(12)
+                .replicas(DEFAULT_REPLICATION_FACTOR)
+                .config(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, MIN_INSYNC_REPLICAS)
                 .build();
     }
 

@@ -25,6 +25,32 @@ const server = http.createServer((req, res) => {
           domain: 'Clinical EHR & ADT',
           tables: ['patients', 'adt_history', 'patient_timeline_events', 'his_kms_patient_keys']
         }
+      ],
+      sagaWorkflow: [
+        {
+          step: 1,
+          name: 'Initiation & Stock Reservation',
+          service: 'Pharmacy Service',
+          actions: ['Insert into pharmacy_orders (status=PENDING)', 'Decrement medication_inventory', 'Emit StockReservedEvent']
+        },
+        {
+          step: 2,
+          name: 'Patient Billing',
+          service: 'Billing Service (IdempotentBillingConsumer)',
+          actions: ['Check billing_accounts', 'Insert payment_transactions ($50.00)', 'Enforce idempotency via his_consumed_messages', 'Emit PaymentChargedEvent']
+        },
+        {
+          step: 3,
+          name: 'Timeline Recording',
+          service: 'Patient Service (PatientTimelinePartitioner)',
+          actions: ['Route via patient_id partition key', 'Insert into patient_timeline_events', 'Emit TimelineUpdatedEvent']
+        },
+        {
+          step: 4,
+          name: 'Completion',
+          service: 'Pharmacy Service / Orchestrator',
+          actions: ['Update pharmacy_orders (status=COMPLETED)', 'Update his_pharmacy_saga_state (status=COMPLETED)', 'Publish PharmacyOrderCompletedEvent']
+        }
       ]
     }
   }, null, 2));

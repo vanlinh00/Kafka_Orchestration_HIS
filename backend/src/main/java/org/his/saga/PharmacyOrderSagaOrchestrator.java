@@ -7,6 +7,7 @@ import org.his.saga.dto.SagaCommandsAndEvents.*;
 import org.his.saga.model.PharmacySagaState;
 import org.his.saga.model.SagaStatus;
 import org.his.saga.repository.SagaStateRepository;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.Acknowledgment;
@@ -17,11 +18,13 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * Stateful Pharmacy Order Saga Orchestrator.
+ * PharmacyOrderSagaOrchestrator
  *
- * Implements the Orchestrated Saga Pattern in Spring Boot 3.4 / Apache Kafka.
- * Workflow: Doctor Places Order -> Inventory Check -> Billing Pre-Auth -> Dispense Dispatch
- * Failure handling: Automated compensation rollbacks across Inventory & Billing.
+ * Implements the 4-step Orchestrated Saga Pattern:
+ * Step 1: Initiation & Stock Reservation (Pharmacy Service)
+ * Step 2: Patient Billing (Billing Service / IdempotentBillingConsumer)
+ * Step 3: Timeline Recording (Patient Service / PatientTimelinePartitioner)
+ * Step 4: Completion (Pharmacy Service)
  */
 @Slf4j
 @Service
@@ -30,163 +33,214 @@ public class PharmacyOrderSagaOrchestrator {
 
     private final SagaStateRepository sagaRepository;
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final JdbcTemplate jdbcTemplate;
 
-    private static final String TOPIC_COMMANDS = "his.pharmacy.saga-commands.v1";
-    private static final String TOPIC_PRESCRIPTION_EVENTS = "his.pharmacy.prescriptions.v1";
+    // Kafka Topics
+    public static final String TOPIC_PHARMACY_COMMANDS = "his.pharmacy.commands.v1";
+    public static final String TOPIC_PHARMACY_EVENTS   = "his.pharmacy.events.v1";
+    public static final String TOPIC_BILLING_COMMANDS  = "his.billing.commands.v1";
+    public static final String TOPIC_BILLING_EVENTS    = "his.billing.events.v1";
+    public static final String TOPIC_PATIENT_COMMANDS  = "his.patient.timeline-commands.v1";
+    public static final String TOPIC_PATIENT_EVENTS    = "his.patient.events.v1";
+    public static final String TOPIC_COMPLETION_EVENTS = "his.pharmacy.prescriptions.v1";
 
     /**
-     * STEP 1: Entry Point - Physician submits pharmacy medication order.
+     * =========================================================================
+     * STEP 1: Initiation & Stock Reservation
+     * =========================================================================
+     * Trigger: API receives request to process prescription.
+     * Orchestrator generates saga_id (e.g. SAGA-1001), persists STARTED status,
+     * and sends ReserveStockCommand to Pharmacy Service.
      */
     @Transactional
-    public String startPrescriptionSaga(DoctorPharmacyOrderRequest request) {
-        String sagaId = "SAGA-" + UUID.randomUUID();
+    public String startPharmacyOrderSaga(ProcessPrescriptionRequest request) {
+        String sagaId = "SAGA-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
+        String orderId = "ORD-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
 
-        // 1. Persist initial Saga state in PostgreSQL
-        PharmacySagaState state = PharmacySagaState.builder()
+        log.info("[Saga {}] STEP 1 INITIATION: Triggered prescription processing for Patient: {}, Drug: {}",
+                sagaId, request.getPatientId(), request.getMedicationCode());
+
+        // 1. Create and save initial Saga State in PostgreSQL
+        PharmacySagaState sagaState = PharmacySagaState.builder()
                 .sagaId(sagaId)
-                .orderId(request.getOrderId())
+                .orderId(orderId)
                 .patientId(request.getPatientId())
                 .medicationCode(request.getMedicationCode())
                 .quantity(request.getQuantity())
-                .estimatedCost(request.getEstimatedCost())
-                .status(SagaStatus.INVENTORY_RESERVATION_PENDING)
+                .estimatedCost(request.getPrice())
+                .status(SagaStatus.STARTED)
                 .build();
-        sagaRepository.save(state);
+        sagaRepository.save(sagaState);
 
-        // 2. Command Step 1 -> Reserve Medication Stock in Pharmacy Inventory
-        ReserveInventoryCommand cmd = new ReserveInventoryCommand(
-                sagaId, request.getOrderId(), request.getMedicationCode(), request.getQuantity()
-        );
-        kafkaTemplate.send(new ProducerRecord<>(TOPIC_COMMANDS, sagaId, cmd));
+        // 2. Send command to Pharmacy Service to reserve inventory
+        ReserveStockCommand command = ReserveStockCommand.builder()
+                .sagaId(sagaId)
+                .orderId(orderId)
+                .prescriptionId(request.getPrescriptionId())
+                .patientId(request.getPatientId())
+                .medicationCode(request.getMedicationCode())
+                .quantity(request.getQuantity())
+                .price(request.getPrice())
+                .build();
 
-        log.info("[Saga {}] Started prescription order. Emitted ReserveInventoryCommand for {}",
-                sagaId, request.getMedicationCode());
+        sagaState.setStatus(SagaStatus.STOCK_RESERVATION_PENDING);
+        sagaRepository.save(sagaState);
+
+        kafkaTemplate.send(new ProducerRecord<>(TOPIC_PHARMACY_COMMANDS, sagaId, command));
+        log.info("[Saga {}] Dispatched ReserveStockCommand to {}", sagaId, TOPIC_PHARMACY_COMMANDS);
+
         return sagaId;
     }
 
     /**
-     * STEP 2 Listener: Inventory Service replies with Reserved or OutOfStock.
+     * =========================================================================
+     * STEP 2: Stock Reserved Event Handler -> Patient Billing Trigger
+     * =========================================================================
+     * Receives StockReservedEvent from Pharmacy Service.
+     * Dispatches ChargePatientBillingCommand ($50) to Billing Service topic
+     * handled by IdempotentBillingConsumer.java.
      */
-    @KafkaListener(topics = "his.pharmacy.inventory-responses.v1", groupId = "pharmacy-saga-orchestrator")
+    @KafkaListener(topics = TOPIC_PHARMACY_EVENTS, groupId = "pharmacy-saga-orchestrator-group")
     @Transactional
-    public void onInventoryEvent(InventoryResponseEvent event, Acknowledgment ack) {
+    public void onStockReservedEvent(StockReservedEvent event, Acknowledgment ack) {
+        log.info("[Saga {}] Received StockReservedEvent. Success: {}", event.getSagaId(), event.isSuccess());
+
         PharmacySagaState state = sagaRepository.findById(event.getSagaId())
-                .orElseThrow(() -> new IllegalStateException("Unknown Saga ID: " + event.getSagaId()));
+                .orElseThrow(() -> new IllegalStateException("Saga not found: " + event.getSagaId()));
 
         if (event.isSuccess()) {
-            state.setStatus(SagaStatus.BILLING_PREAUTH_PENDING);
-            state.setInventoryLockId(event.getLockId());
+            state.setStatus(SagaStatus.STOCK_RESERVED);
+            state.setStatus(SagaStatus.BILLING_PENDING);
             sagaRepository.save(state);
 
-            // Step 3 Command -> Request Billing Pre-authorization
-            AuthorizeBillingCommand billingCmd = new AuthorizeBillingCommand(
-                    state.getSagaId(), state.getPatientId(), state.getOrderId(), state.getEstimatedCost()
-            );
-            kafkaTemplate.send(new ProducerRecord<>(TOPIC_COMMANDS, state.getSagaId(), billingCmd));
-            log.info("[Saga {}] Stock locked (#{}). Dispatched AuthorizeBillingCommand.",
-                    state.getSagaId(), event.getLockId());
+            // Command Step 2: Patient Billing ($50 charge)
+            ChargePatientBillingCommand billingCmd = ChargePatientBillingCommand.builder()
+                    .sagaId(state.getSagaId())
+                    .orderId(state.getOrderId())
+                    .patientId(state.getPatientId())
+                    .amount(state.getEstimatedCost()) // e.g., $50.00
+                    .description("Prescription fulfillment for " + state.getMedicationCode())
+                    .build();
+
+            kafkaTemplate.send(new ProducerRecord<>(TOPIC_BILLING_COMMANDS, state.getSagaId(), billingCmd));
+            log.info("[Saga {}] Dispatched ChargePatientBillingCommand (${}) to {}",
+                    state.getSagaId(), state.getEstimatedCost(), TOPIC_BILLING_COMMANDS);
         } else {
-            // Failure: Medication out of stock -> Terminate Saga, notify physician
-            state.setStatus(SagaStatus.FAILED_OUT_OF_STOCK);
-            state.setFailureReason("Medication unavailable in pharmacy inventory: " + event.getFailureReason());
+            // Inventory shortage compensation
+            state.setStatus(SagaStatus.FAILED_STOCK_UNAVAILABLE);
+            state.setFailureReason("Medication inventory out of stock: " + event.getFailureReason());
             state.setCompletedAt(Instant.now());
             sagaRepository.save(state);
-
-            publishSagaFailureEvent(state, "OUT_OF_STOCK");
-            log.warn("[Saga {}] Inventory reservation failed. Terminated.", state.getSagaId());
+            log.warn("[Saga {}] Stock reservation failed. Saga terminated.", state.getSagaId());
         }
+
         ack.acknowledge();
     }
 
     /**
-     * STEP 3 Listener: Billing Service replies with Pre-Auth Approved or Denied.
+     * =========================================================================
+     * STEP 3: Payment Charged Event Handler -> Timeline Recording Trigger
+     * =========================================================================
+     * Receives PaymentChargedEvent from Billing Service.
+     * Dispatches RecordPatientTimelineCommand to Patient Service.
+     * Uses patient_id as partition key via PatientTimelinePartitioner for chronological ordering.
      */
-    @KafkaListener(topics = "his.billing.preauth-responses.v1", groupId = "pharmacy-saga-orchestrator")
+    @KafkaListener(topics = TOPIC_BILLING_EVENTS, groupId = "pharmacy-saga-orchestrator-group")
     @Transactional
-    public void onBillingResponse(BillingPreAuthResponseEvent event, Acknowledgment ack) {
+    public void onPaymentChargedEvent(PaymentChargedEvent event, Acknowledgment ack) {
+        log.info("[Saga {}] Received PaymentChargedEvent. Success: {}", event.getSagaId(), event.isSuccess());
+
         PharmacySagaState state = sagaRepository.findById(event.getSagaId())
-                .orElseThrow(() -> new IllegalStateException("Unknown Saga ID: " + event.getSagaId()));
-
-        if (event.isApproved()) {
-            state.setStatus(SagaStatus.DISPATCH_PENDING);
-            state.setPreAuthCode(event.getPreAuthAuthorizationCode());
-            sagaRepository.save(state);
-
-            // Step 4 Command -> Dispatch to Automated Dispensing Cabinet (Pyxis/Omnicell)
-            DispatchPrescriptionCommand dispatchCmd = new DispatchPrescriptionCommand(
-                    state.getSagaId(), state.getOrderId(), state.getPatientId(), state.getMedicationCode()
-            );
-            kafkaTemplate.send(new ProducerRecord<>(TOPIC_COMMANDS, state.getSagaId(), dispatchCmd));
-            log.info("[Saga {}] Pre-auth approved. Dispatched DispatchPrescriptionCommand.", state.getSagaId());
-        } else {
-            // COMPENSATION TRIGGER: Billing Rejected -> Rollback Inventory Lock!
-            log.warn("[Saga {}] Billing denied ({}). Triggering COMPENSATION: ReleaseInventory.",
-                    state.getSagaId(), event.getDenialReason());
-
-            state.setStatus(SagaStatus.COMPENSATING_BILLING_FAILED);
-            state.setFailureReason("Billing Rejected: " + event.getDenialReason());
-            sagaRepository.save(state);
-
-            // Send Compensation Event to Inventory Service
-            ReleaseInventoryCommand rollbackCmd = new ReleaseInventoryCommand(
-                    state.getSagaId(), state.getInventoryLockId(), state.getMedicationCode(), state.getQuantity()
-            );
-            kafkaTemplate.send(new ProducerRecord<>(TOPIC_COMMANDS, state.getSagaId(), rollbackCmd));
-
-            publishSagaFailureEvent(state, "BILLING_DENIED");
-        }
-        ack.acknowledge();
-    }
-
-    /**
-     * STEP 4 Listener: Dispense Cabinet confirms physical dispatch or reports hardware jam.
-     */
-    @KafkaListener(topics = "his.pharmacy.dispense-events.v1", groupId = "pharmacy-saga-orchestrator")
-    @Transactional
-    public void onDispenseConfirmed(PrescriptionDispatchedEvent event, Acknowledgment ack) {
-        PharmacySagaState state = sagaRepository.findById(event.getSagaId())
-                .orElseThrow(() -> new IllegalStateException("Unknown Saga ID: " + event.getSagaId()));
+                .orElseThrow(() -> new IllegalStateException("Saga not found: " + event.getSagaId()));
 
         if (event.isSuccess()) {
+            state.setStatus(SagaStatus.PAYMENT_CHARGED);
+            state.setPreAuthCode(event.getTransactionId());
+            state.setStatus(SagaStatus.TIMELINE_PENDING);
+            sagaRepository.save(state);
+
+            // Command Step 3: Timeline Recording (Keyed by patient_id)
+            RecordPatientTimelineCommand timelineCmd = RecordPatientTimelineCommand.builder()
+                    .sagaId(state.getSagaId())
+                    .patientId(state.getPatientId())
+                    .orderId(state.getOrderId())
+                    .eventType("PHARMACY_ORDER_DISPENSED")
+                    .description(String.format("Prescription %s fulfilled for %s (Qty: %d, Cost: $%.2f)",
+                            state.getOrderId(), state.getMedicationCode(), state.getQuantity(), state.getEstimatedCost()))
+                    .occurredAt(Instant.now())
+                    .build();
+
+            // Routed via PatientTimelinePartitioner using patientId as key
+            kafkaTemplate.send(new ProducerRecord<>(TOPIC_PATIENT_COMMANDS, state.getPatientId(), timelineCmd));
+            log.info("[Saga {}] Dispatched RecordPatientTimelineCommand for patient {} to {}",
+                    state.getSagaId(), state.getPatientId(), TOPIC_PATIENT_COMMANDS);
+        } else {
+            // Billing compensation: Rollback reserved stock
+            log.warn("[Saga {}] Billing failed ({}). Triggering COMPENSATION: ReleaseStock.",
+                    state.getSagaId(), event.getDenialReason());
+            state.setStatus(SagaStatus.COMPENSATING_BILLING_FAILED);
+            state.setFailureReason("Billing declined: " + event.getDenialReason());
+            sagaRepository.save(state);
+
+            ReleaseStockCommand releaseCmd = ReleaseStockCommand.builder()
+                    .sagaId(state.getSagaId())
+                    .orderId(state.getOrderId())
+                    .medicationCode(state.getMedicationCode())
+                    .quantity(state.getQuantity())
+                    .build();
+
+            kafkaTemplate.send(new ProducerRecord<>(TOPIC_PHARMACY_COMMANDS, state.getSagaId(), releaseCmd));
+        }
+
+        ack.acknowledge();
+    }
+
+    /**
+     * =========================================================================
+     * STEP 4: Timeline Updated Event Handler -> Saga Completion
+     * =========================================================================
+     * Receives TimelineUpdatedEvent from Patient Service.
+     * Marks pharmacy_orders status as COMPLETED and successfully ends the Saga.
+     */
+    @KafkaListener(topics = TOPIC_PATIENT_EVENTS, groupId = "pharmacy-saga-orchestrator-group")
+    @Transactional
+    public void onTimelineUpdatedEvent(TimelineUpdatedEvent event, Acknowledgment ack) {
+        log.info("[Saga {}] Received TimelineUpdatedEvent. Success: {}", event.getSagaId(), event.isSuccess());
+
+        PharmacySagaState state = sagaRepository.findById(event.getSagaId())
+                .orElseThrow(() -> new IllegalStateException("Saga not found: " + event.getSagaId()));
+
+        if (event.isSuccess()) {
+            // 1. Mark Saga state as COMPLETED
             state.setStatus(SagaStatus.COMPLETED);
             state.setCompletedAt(Instant.now());
             sagaRepository.save(state);
 
-            PrescriptionFulfilledEvent successEvent = new PrescriptionFulfilledEvent(
-                    state.getSagaId(), state.getOrderId(), state.getPatientId(), Instant.now()
+            // 2. Update pharmacy_orders table to COMPLETED
+            jdbcTemplate.update(
+                    "UPDATE pharmacy_orders SET status = 'COMPLETED', updated_at = NOW() WHERE order_id = ?",
+                    state.getOrderId()
             );
-            kafkaTemplate.send(new ProducerRecord<>(TOPIC_PRESCRIPTION_EVENTS, state.getPatientId(), successEvent));
-            log.info("[Saga {}] Pharmacy workflow completed successfully. Medication dispensed.", state.getSagaId());
+
+            // 3. Publish final terminal domain event
+            PharmacyOrderCompletedEvent completedEvent = PharmacyOrderCompletedEvent.builder()
+                    .sagaId(state.getSagaId())
+                    .orderId(state.getOrderId())
+                    .patientId(state.getPatientId())
+                    .completedAt(Instant.now())
+                    .build();
+
+            kafkaTemplate.send(new ProducerRecord<>(TOPIC_COMPLETION_EVENTS, state.getPatientId(), completedEvent));
+
+            log.info("[Saga {}] STEP 4 COMPLETION: Pharmacy order {} marked as COMPLETED. Saga finished successfully.",
+                    state.getSagaId(), state.getOrderId());
         } else {
-            // DUAL COMPENSATION TRIGGER: Pyxis Drawer Jam / Hardware fault
-            log.error("[Saga {}] Pyxis hardware fault ({}). Triggering DUAL COMPENSATION.",
-                    state.getSagaId(), event.getFailureReason());
-
-            state.setStatus(SagaStatus.COMPENSATING_DISPATCH_JAM);
-            state.setFailureReason("Cabinet hardware fault: " + event.getFailureReason());
+            state.setStatus(SagaStatus.FAILED_ROLLED_BACK);
+            state.setFailureReason("Failed to append patient clinical timeline.");
             sagaRepository.save(state);
-
-            // 1. Rollback Billing Hold
-            VoidBillingHoldCommand voidBilling = new VoidBillingHoldCommand(
-                    state.getSagaId(), state.getPreAuthCode(), state.getPatientId()
-            );
-            kafkaTemplate.send(new ProducerRecord<>(TOPIC_COMMANDS, state.getSagaId(), voidBilling));
-
-            // 2. Return Inventory to Stock
-            ReleaseInventoryCommand restock = new ReleaseInventoryCommand(
-                    state.getSagaId(), state.getInventoryLockId(), state.getMedicationCode(), state.getQuantity()
-            );
-            kafkaTemplate.send(new ProducerRecord<>(TOPIC_COMMANDS, state.getSagaId(), restock));
-
-            publishSagaFailureEvent(state, "HARDWARE_JAM");
+            log.error("[Saga {}] Timeline recording failed. Marked as FAILED_ROLLED_BACK.", state.getSagaId());
         }
-        ack.acknowledge();
-    }
 
-    private void publishSagaFailureEvent(PharmacySagaState state, String reasonCode) {
-        PrescriptionFailedEvent failedEvent = new PrescriptionFailedEvent(
-                state.getSagaId(), state.getOrderId(), state.getPatientId(), reasonCode, state.getFailureReason()
-        );
-        kafkaTemplate.send(new ProducerRecord<>(TOPIC_PRESCRIPTION_EVENTS, state.getPatientId(), failedEvent));
+        ack.acknowledge();
     }
 }
